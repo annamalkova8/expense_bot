@@ -1,0 +1,6 @@
+bills.ipynb
+*.csv
+run_instr.txt
+trati.xlsx
+.venv
+__pycache__
