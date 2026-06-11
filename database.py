@@ -9,7 +9,6 @@ from datetime import datetime
 DB_NAME = os.getenv("DB_PATH", "expenses.db")
 
 # ─── Who's in the household ───────────────────────────────────────────────────
-# Edit these two names. They must match the canonical names used in bot.py NAME_MAP.
 MEMBER_1 = "аня"
 MEMBER_2 = "ваня"
 
@@ -54,11 +53,10 @@ def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Migrate existing DBs that don't have the split column yet
         try:
             c.execute("ALTER TABLE expenses ADD COLUMN split INTEGER DEFAULT 2")
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass
         conn.commit()
 
 
@@ -72,92 +70,30 @@ def add_expense(category, amount, currency, buyer, payer, timestamp, split=2):
         conn.commit()
 
 
-def _distribute_expense(category: str, amount: float, buyer: str, split: int) -> dict:
-    """
-    Returns {member: amount_they_consumed} for a single expense.
-    Handles: shared (оба), custom аренда split, single-person, and n-way split.
-    """
-    members = [MEMBER_1, MEMBER_2]
-
-    if buyer == "оба":
-        if category.lower() == "аренда":
-            return {m: amount * frac for m, frac in ARENDA_SPLIT.items()}
-        else:
-            per = amount / len(members)
-            return {m: per for m in members}
-
-    if buyer in members:
-        return {buyer: amount}
-
-    # Generic n-way split (future-proof for group trips etc.)
-    per = amount / max(split, 1)
-    return {m: per for m in members}
-
-
-def get_statistics(start_date: str, end_date: str, output_currency: str) -> str:
+def get_recent_expenses(limit: int = 10) -> list:
+    """Returns last N expenses as list of dicts for display."""
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
         c.execute("""
-            SELECT timestamp, category, amount, currency, buyer, payer, COALESCE(split, 2)
+            SELECT id, category, amount, currency, buyer, payer, timestamp
             FROM expenses
-            WHERE DATE(timestamp) BETWEEN ? AND ?
-            ORDER BY timestamp ASC
-        """, (start_date, end_date))
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,))
         rows = c.fetchall()
+    return [
+        {"id": r[0], "category": r[1], "amount": r[2], "currency": r[3],
+         "buyer": r[4], "payer": r[5], "timestamp": r[6]}
+        for r in rows
+    ]
 
-    if not rows:
-        return "Нет данных за указанный период."
 
-    spent = defaultdict(float)   # how much each person consumed
-    paid = defaultdict(float)    # how much each person actually paid
-    category_totals = defaultdict(float)
-
-    for timestamp, category, amount, exp_currency, buyer, payer, split in rows:
-        rate = get_exchange_rate(exp_currency, output_currency)
-        converted = amount * rate
-
-        category_totals[category] += converted
-        if payer and payer not in ("оба", "общее", "неизвестно"):
-            paid[payer] += converted
-
-        distribution = _distribute_expense(category, converted, buyer, split)
-        for member, share in distribution.items():
-            spent[member] += share
-
-    members = sorted(set(list(spent.keys()) + list(paid.keys())))
-    balances = {
-        m: round(paid.get(m, 0) - spent.get(m, 0), 2)
-        for m in members
-    }
-
-    lines = [f"📅 *Статистика {start_date} – {end_date}* ({output_currency.upper()})\n"]
-
-    lines.append("💸 *Потрачено:*")
-    for m in members:
-        lines.append(f"  {m}: {spent[m]:.2f}")
-
-    lines.append("\n💰 *Баланс* (+ = должны тебе, − = ты должен):")
-    for m in members:
-        bal = balances[m]
-        sign = "+" if bal >= 0 else ""
-        lines.append(f"  {m}: {sign}{bal:.2f}")
-
-    # Settlement suggestion
-    creditors = {m: b for m, b in balances.items() if b > 0}
-    debtors = {m: -b for m, b in balances.items() if b < 0}
-    if creditors and debtors:
-        lines.append("\n🔁 *Перевести:*")
-        for debtor, debt in debtors.items():
-            for creditor, credit in creditors.items():
-                transfer = min(debt, credit)
-                if transfer > 0.01:
-                    lines.append(f"  {debtor} → {creditor}: {transfer:.2f} {output_currency.upper()}")
-
-    lines.append("\n📊 *По категориям:*")
-    for cat, total in sorted(category_totals.items(), key=lambda x: -x[1]):
-        lines.append(f"  {cat}: {total:.2f}")
-
-    return "\n".join(lines)
+def delete_expense_by_id(expense_id: int) -> bool:
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+        conn.commit()
+        return c.rowcount > 0
 
 
 def delete_expense(category, amount, currency, buyer, payer, date):
@@ -176,6 +112,102 @@ def delete_expense(category, amount, currency, buyer, payer, date):
         """, (category, amount, currency, buyer, payer, date))
         conn.commit()
         return c.rowcount > 0
+
+
+def _distribute_expense(category: str, amount: float, buyer: str, split: int) -> dict:
+    members = [MEMBER_1, MEMBER_2]
+
+    # Transfers don't affect spending — they only affect balance via paid/received
+    if category == "перевод":
+        return {}
+
+    if buyer == "оба":
+        if category.lower() == "аренда":
+            return {m: amount * frac for m, frac in ARENDA_SPLIT.items()}
+        else:
+            per = amount / len(members)
+            return {m: per for m in members}
+
+    if buyer in members:
+        return {buyer: amount}
+
+    per = amount / max(split, 1)
+    return {m: per for m in members}
+
+
+def get_statistics(start_date: str, end_date: str, output_currency: str) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT timestamp, category, amount, currency, buyer, payer, COALESCE(split, 2)
+            FROM expenses
+            WHERE DATE(timestamp) BETWEEN ? AND ?
+            ORDER BY timestamp ASC
+        """, (start_date, end_date))
+        rows = c.fetchall()
+
+    if not rows:
+        return "Нет данных за указанный период."
+
+    spent = defaultdict(float)
+    paid = defaultdict(float)
+    received = defaultdict(float)  # for tracking transfers
+    category_totals = defaultdict(float)
+
+    for timestamp, category, amount, exp_currency, buyer, payer, split in rows:
+        rate = get_exchange_rate(exp_currency, output_currency)
+        converted = amount * rate
+
+        if category == "перевод":
+            # buyer = who received the money, payer = who sent it
+            # This reduces what payer owes (or increases what buyer owes)
+            if payer and payer not in ("неизвестно",):
+                received[payer] += converted   # payer sent money → credit
+            if buyer and buyer not in ("неизвестно",):
+                received[buyer] -= converted   # buyer received money → debit
+            continue
+
+        category_totals[category] += converted
+        if payer and payer not in ("оба", "общее", "неизвестно"):
+            paid[payer] += converted
+
+        distribution = _distribute_expense(category, converted, buyer, split)
+        for member, share in distribution.items():
+            spent[member] += share
+
+    members = sorted(set(list(spent.keys()) + list(paid.keys()) + list(received.keys())))
+    balances = {
+        m: round(paid.get(m, 0) - spent.get(m, 0) + received.get(m, 0), 2)
+        for m in members
+    }
+
+    lines = [f"📅 *Статистика {start_date} – {end_date}* ({output_currency.upper()})\n"]
+
+    lines.append("💸 *Потрачено:*")
+    for m in members:
+        lines.append(f"  {m}: {spent[m]:.2f}")
+
+    lines.append("\n💰 *Баланс* (+ = должны тебе, − = ты должен):")
+    for m in members:
+        bal = balances[m]
+        sign = "+" if bal >= 0 else ""
+        lines.append(f"  {m}: {sign}{bal:.2f}")
+
+    creditors = {m: b for m, b in balances.items() if b > 0}
+    debtors = {m: -b for m, b in balances.items() if b < 0}
+    if creditors and debtors:
+        lines.append("\n🔁 *Перевести:*")
+        for debtor, debt in debtors.items():
+            for creditor, credit in creditors.items():
+                transfer = min(debt, credit)
+                if transfer > 0.01:
+                    lines.append(f"  {debtor} → {creditor}: {transfer:.2f} {output_currency.upper()}")
+
+    lines.append("\n📊 *По категориям:*")
+    for cat, total in sorted(category_totals.items(), key=lambda x: -x[1]):
+        lines.append(f"  {cat}: {total:.2f}")
+
+    return "\n".join(lines)
 
 
 def export_csv():
