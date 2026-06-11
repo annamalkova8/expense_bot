@@ -4,3 +4,5 @@ run_instr.txt
 trati.xlsx
 .venv
 __pycache__
+.env
+tg_bot.py
